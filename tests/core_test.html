@@ -1,0 +1,478 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Epitope mapper core test</title>
+<body style="font:13px/1.55 ui-monospace,Consolas,monospace;background:#111;color:#ddd;padding:16px">
+<pre id="out">running...</pre>
+<script src="../js/chem.js"></script>
+<script src="../js/pdb.js"></script>
+<script src="../js/sasa.js"></script>
+<script src="../js/elec.js"></script>
+<script src="../js/colour.js"></script>
+<script>
+/* Analytic and self-consistency checks that need no data files:
+ *   - the area of an isolated atom and of a two-atom pair against closed-form geometry,
+ *   - the grid + last-occluder search against a brute-force O(n^2) implementation,
+ *   - the parser (alternate locations, waters, dummy atoms, element inference, round trip),
+ *   - lipid-slab occlusion and the membrane zones,
+ *   - exclusion really restoring a neighbour's area.
+ * tests/accuracy_test.html does the same against a real structure and an independent reference. */
+const out = document.getElementById('out');
+let pass = 0, fail = 0;
+const log = (s) => { out.textContent += s + '\n'; };
+function ok(name, cond, detail) {
+  if (cond) { pass++; log('  ok   ' + name + (detail ? '   ' + detail : '')); }
+  else { fail++; log('  FAIL ' + name + (detail ? '   ' + detail : '')); }
+}
+function near(name, got, want, tol, unit) {
+  const d = Math.abs(got - want);
+  ok(name, d <= tol, 'got ' + got.toPrecision(8) + ', want ' + want.toPrecision(8)
+     + ' (|d| ' + d.toExponential(2) + ' <= ' + tol + (unit || '') + ')');
+}
+function head(s) { log('\n' + s); }
+
+/* ---------------------------------------------------------------- helpers */
+function makePDB(list, opts) {
+  opts = opts || {};
+  const lines = [];
+  list.forEach((a, i) => {
+    const atom = Object.assign({
+      name: 'CA', altLoc: '', resName: 'ALA', chainID: 'A', resSeq: i + 1, iCode: '',
+      occ: 1, b: 0, element: 'C', isHet: false,
+    }, a);
+    lines.push(PDB.atomToLine(atom, i + 1));
+  });
+  lines.push('END');
+  return lines.join('\n') + '\n';
+}
+
+/** Brute-force Shrake-Rupley: no grid, no early exit, no shortcuts. */
+function bruteSASA(st, probe, nPoints, slab) {
+  const pts = SASA.spherePoints(nPoints);
+  const n = st.atoms.length;
+  const solvent = new Float64Array(n), free = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const ai = st.atoms[i];
+    if (ai.isH) continue;
+    const Ri = ai.radius + probe;
+    let accFree = 0, accSolv = 0;
+    for (let p = 0; p < nPoints; p++) {
+      const px = ai.x + Ri * pts[3 * p], py = ai.y + Ri * pts[3 * p + 1], pz = ai.z + Ri * pts[3 * p + 2];
+      let blocked = false;
+      for (let j = 0; j < n && !blocked; j++) {
+        if (j === i || st.atoms[j].isH) continue;
+        const aj = st.atoms[j], Rj = aj.radius + probe;
+        const dx = aj.x - px, dy = aj.y - py, dz = aj.z - pz;
+        if (dx * dx + dy * dy + dz * dz < Rj * Rj) blocked = true;
+      }
+      if (blocked) continue;
+      accFree++;
+      if (slab && pz >= slab.zLo && pz <= slab.zHi) continue;
+      accSolv++;
+    }
+    const unit = 4 * Math.PI * Ri * Ri / nPoints;
+    free[i] = accFree * unit;
+    solvent[i] = accSolv * unit;
+  }
+  return { solvent, free };
+}
+
+function total(arr) { let s = 0; for (const v of arr) s += v; return s; }
+
+try {
+  out.textContent = '';
+
+  /* ------------------------------------------------------------ test points */
+  head('sphere points');
+  for (const n of [12, 50, 100, 480]) {
+    const p = SASA.spherePoints(n);
+    ok('count ' + n, p.length === 3 * n);
+    let worst = 0, sx = 0, sy = 0, sz = 0;
+    for (let k = 0; k < n; k++) {
+      const r = Math.hypot(p[3 * k], p[3 * k + 1], p[3 * k + 2]);
+      worst = Math.max(worst, Math.abs(r - 1));
+      sx += p[3 * k]; sy += p[3 * k + 1]; sz += p[3 * k + 2];
+    }
+    ok('unit length ' + n, worst < 1e-12, 'max |r-1| = ' + worst.toExponential(2));
+    // The residual offset of a spiral set falls off with the point count.
+    const centroid = Math.hypot(sx, sy, sz) / n, cTol = 0.3 / Math.sqrt(n);
+    ok('centred ' + n, centroid < cTol,
+       'centroid ' + centroid.toExponential(2) + ' < ' + cTol.toFixed(4));
+  }
+
+  /* ------------------------------------------------------- isolated atom */
+  head('isolated atom: analytic 4*pi*(r+probe)^2');
+  {
+    const st = PDB.parse(makePDB([{ x: 0, y: 0, z: 0 }]), 'one.pdb');
+    const want = 4 * Math.PI * Math.pow(1.70 + 1.4, 2);
+    const job = SASA.compute(st, { nPoints: 100 });
+    near('carbon, 100 points', job.sasa[0], want, 1e-9, ' A^2');
+    const job2 = SASA.compute(st, { nPoints: 480, probe: 1.0 });
+    near('carbon, probe 1.0', job2.sasa[0], 4 * Math.PI * Math.pow(1.70 + 1.0, 2), 1e-9, ' A^2');
+  }
+
+  /* ----------------------------------------------------- two-atom overlap */
+  head('two atoms: analytic spherical cap');
+  for (const d of [2.0, 3.0, 4.5, 5.5]) {
+    const R = 1.70 + 1.4;
+    const cosT = (d * d + R * R - R * R) / (2 * d * R);
+    const hidden = d < 2 * R ? 2 * Math.PI * R * R * (1 - cosT) : 0;
+    const want = 4 * Math.PI * R * R - hidden;
+    const st = PDB.parse(makePDB([{ x: 0, y: 0, z: 0 }, { x: d, y: 0, z: 0 }]), 'two.pdb');
+    const j100 = SASA.compute(st, { nPoints: 100 });
+    const j480 = SASA.compute(st, { nPoints: 480 });
+    const e100 = Math.abs(j100.sasa[0] - want) / want * 100;
+    const e480 = Math.abs(j480.sasa[0] - want) / want * 100;
+    ok('d=' + d + ' A, 100 points within 4%', e100 < 4, 'error ' + e100.toFixed(2) + '%');
+    ok('d=' + d + ' A, 480 points within 1.5%', e480 < 1.5, 'error ' + e480.toFixed(2) + '%'
+       + ', want ' + want.toFixed(3));
+    // The spiral point set is not mirror symmetric, so the two atoms can disagree by a point or
+    // two: the occluded caps face opposite directions. Allow three point areas.
+    const unit = 4 * Math.PI * R * R / 480;
+    ok('d=' + d + ' A, symmetric to within 3 test points',
+       Math.abs(j480.sasa[0] - j480.sasa[1]) < 3 * unit,
+       'difference ' + Math.abs(j480.sasa[0] - j480.sasa[1]).toFixed(3) + ' A^2, one point is '
+       + unit.toFixed(3) + ' A^2');
+  }
+
+  /* -------------------------------------------- grid against brute force */
+  head('grid + last-occluder search against brute force');
+  {
+    let seed = 20260413;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const list = [];
+    const els = ['C', 'N', 'O', 'S'];
+    for (let i = 0; i < 300; i++) {
+      list.push({
+        x: rnd() * 22, y: rnd() * 22, z: rnd() * 22,
+        element: els[Math.floor(rnd() * 4)], resSeq: i + 1,
+      });
+    }
+    const st = PDB.parse(makePDB(list), 'cloud.pdb');
+    ok('cloud parsed', st.atoms.length === 300 && st.residues.length === 300,
+       st.atoms.length + ' atoms, ' + st.residues.length + ' residues');
+    const fast = SASA.compute(st, { nPoints: 100 });
+    const slow = bruteSASA(st, 1.4, 100, null);
+    let worst = 0;
+    for (let i = 0; i < st.atoms.length; i++) worst = Math.max(worst, Math.abs(fast.sasa[i] - slow.solvent[i]));
+    near('total area', total(fast.sasa), total(slow.solvent), 1e-7, ' A^2');
+    ok('every atom matches', worst < 1e-9, 'max per-atom difference ' + worst.toExponential(2));
+
+    const slab = { zLo: 6, zHi: 16 };
+    const fastM = SASA.compute(st, { nPoints: 100, slab: slab });
+    const slowM = bruteSASA(st, 1.4, 100, slab);
+    let worstM = 0, worstF = 0;
+    for (let i = 0; i < st.atoms.length; i++) {
+      worstM = Math.max(worstM, Math.abs(fastM.sasa[i] - slowM.solvent[i]));
+      worstF = Math.max(worstF, Math.abs(fastM.sasaFree[i] - slowM.free[i]));
+    }
+    ok('slab mode matches', worstM < 1e-9, 'max difference ' + worstM.toExponential(2));
+    ok('slab-free pass matches', worstF < 1e-9, 'max difference ' + worstF.toExponential(2));
+    ok('slab buries area', total(fastM.sasa) < total(fastM.sasaFree),
+       total(fastM.sasa).toFixed(1) + ' < ' + total(fastM.sasaFree).toFixed(1) + ' A^2');
+
+    const t0 = performance.now();
+    SASA.compute(st, { nPoints: 100 });
+    log('  ...300 atoms, 100 points: ' + (performance.now() - t0).toFixed(1) + ' ms');
+  }
+
+  /* ------------------------------------------------------- lipid occlusion */
+  head('lipid slab');
+  {
+    const want = 4 * Math.PI * Math.pow(3.1, 2);
+    const st = PDB.parse(makePDB([
+      { x: 0, y: 0, z: 0, resSeq: 1 },       // middle of the slab
+      { x: 40, y: 0, z: 30, resSeq: 2 },     // well outside
+      { x: 80, y: 0, z: 15, resSeq: 3 },     // on the upper boundary
+    ]), 'slab.pdb');
+    const job = SASA.compute(st, { nPoints: 480, slab: { zLo: -15, zHi: 15 } });
+    near('buried atom has no solvent area', job.sasa[0], 0, 1e-9, ' A^2');
+    near('buried atom keeps its free area', job.sasaFree[0], want, 1e-9, ' A^2');
+    near('distant atom unaffected', job.sasa[1], want, 1e-9, ' A^2');
+    const half = job.sasa[2] / want;
+    ok('boundary atom about half exposed', Math.abs(half - 0.5) < 0.02,
+       (100 * half).toFixed(1) + '% of its sphere is above the plane');
+
+    const rows = SASA.residueMetrics(st, job, { slab: { zLo: -15, zHi: 15 }, headgroup: 5 });
+    ok('zone of the buried atom', rows[0].zone === 'core', rows[0].zone);
+    ok('zone of the distant atom', rows[1].zone === 'side+', rows[1].zone);
+    ok('lipid area recorded', Math.abs(rows[0].lipid - want) < 1e-9, rows[0].lipid.toFixed(2) + ' A^2');
+    ok('zone by centroid, above', SASA.membraneZone(-15, 15, 5, 16, 18, 17) === 'head+');
+    ok('zone by centroid, below', SASA.membraneZone(-15, 15, 5, -18, -16, -17) === 'head-');
+    ok('zone by centroid, far above', SASA.membraneZone(-15, 15, 5, 39, 41, 40) === 'side+');
+    ok('zone by centroid, far below', SASA.membraneZone(-15, 15, 5, -41, -39, -40) === 'side-');
+    ok('zone spanning the slab', SASA.membraneZone(-15, 15, 5, -20, 20, 0) === 'core');
+
+    ok('a face takes its headgroup band with it',
+       SASA.zoneSide('side+') === 'plus' && SASA.zoneSide('head+') === 'plus'
+       && SASA.zoneSide('side-') === 'minus' && SASA.zoneSide('head-') === 'minus');
+    ok('the bilayer core belongs to neither face', SASA.zoneSide('core') === 'core');
+    ok('no membrane means no face', SASA.zoneSide('') === '');
+  }
+
+  /* ---------------------------------------------------------------- parser */
+  head('parser');
+  {
+    const text = [
+      'HELIX    1   1 ALA A    1  ALA A    4  1                                   4',
+      'ATOM      1  N   THR A   1      17.047  14.099   3.625  1.00 13.79           N',
+      'ATOM      2  CA  THR A   1      16.967  12.784   4.338  1.00 10.80           C',
+      'ATOM      3  CB ATHR A   1      17.000  12.000   5.000  0.40 10.00           C',
+      'ATOM      4  CB BTHR A   1      17.500  12.500   5.500  0.60 10.00           C',
+      'ATOM      5  N   GLY A   1A     18.000  12.000   6.000  1.00 10.00           N',
+      'HETATM    6 ZN    ZN A 100      20.000  12.000   6.000  1.00 10.00',
+      'HETATM    7  O   HOH A 200      25.000  12.000   6.000  1.00 10.00           O',
+      'HETATM    8  N   DUM A 300      30.000  30.000  15.000  1.00  0.00           N',
+      'HETATM    9  O   DUM A 301      30.000  30.000 -15.000  1.00  0.00           O',
+      'ATOM     10  SE  MSE B   5      40.000  12.000   6.000  1.00 10.00',
+      'END',
+    ].join('\n');
+    const st = PDB.parse(text, 'mix.pdb');
+    ok('waters dropped', st.counts.waters === 1, st.counts.waters + ' water');
+    ok('dummies routed out', st.dummies.length === 2, st.dummies.length + ' dummy atoms');
+    ok('alternate locations resolved', st.atoms.length === 6,
+       st.atoms.map((a) => a.name).join(','));
+    const cb = st.atoms.find((a) => a.name === 'CB');
+    ok('kept the higher occupancy altloc', cb && Math.abs(cb.x - 17.5) < 1e-6,
+       cb ? 'x = ' + cb.x : 'missing');
+    ok('insertion code is its own residue',
+       st.residues.some((r) => r.resSeq === 1 && r.iCode === 'A'),
+       st.residues.map((r) => r.tag).join(' '));
+    const zn = st.atoms.find((a) => a.resName === 'ZN');
+    ok('two-letter element inferred without a column', zn && zn.element === 'ZN',
+       zn ? zn.element + ', radius ' + zn.radius : 'missing');
+    const se = st.atoms.find((a) => a.resName === 'MSE');
+    ok('selenomethionine SE inferred', se && se.element === 'SE',
+       se ? se.element + ', radius ' + se.radius : 'missing');
+    ok('MSE maps to MET', Chem.canonical('MSE') === 'MET' && Chem.one('MSE') === 'M');
+    ok('header records kept', st.header.length === 1, st.header.length + ' record');
+    ok('chains found', st.chains.length === 2, st.chains.map((c) => c.id).join(','));
+    ok('het residue flagged', st.residues.find((r) => r.resName === 'ZN').isHet === true);
+
+    const mem = PDB.detectMembrane(st.dummies);
+    ok('two dummies are too few for a slab', mem === null, String(mem));
+
+    // Round trip.
+    const rt = PDB.parse(PDB.toPDBText(st, {}), 'rt.pdb');
+    ok('round trip keeps the atom count', rt.atoms.length === st.atoms.length,
+       rt.atoms.length + ' vs ' + st.atoms.length);
+    let worst = 0;
+    for (let i = 0; i < rt.atoms.length; i++) {
+      worst = Math.max(worst,
+        Math.abs(rt.atoms[i].x - st.atoms[i].x),
+        Math.abs(rt.atoms[i].y - st.atoms[i].y),
+        Math.abs(rt.atoms[i].z - st.atoms[i].z));
+      if (rt.atoms[i].name !== st.atoms[i].name) worst = 99;
+    }
+    ok('round trip keeps order and coordinates', worst < 1e-9, 'max drift ' + worst);
+  }
+
+  /* --------------------------------------------------------- PPM dummy grid */
+  head('PPM dummy atoms');
+  {
+    const list = [];
+    for (let i = 0; i < 7; i++) {
+      for (let j = 0; j < 7; j++) {
+        list.push({ name: 'N', resName: 'DUM', x: i * 5 - 15, y: j * 5 - 15, z: 14.8, isHet: true, resSeq: 900 });
+        list.push({ name: 'O', resName: 'DUM', x: i * 5 - 15, y: j * 5 - 15, z: -15.2, isHet: true, resSeq: 901 });
+      }
+    }
+    list.push({ x: 0, y: 0, z: 0, resName: 'LEU', resSeq: 1 });
+    const st = PDB.parse(makePDB(list), 'ppm.pdb');
+    const mem = PDB.detectMembrane(st.dummies);
+    ok('slab found', !!mem);
+    near('lower boundary', mem.zLo, -15.2, 1e-9, ' A');
+    near('upper boundary', mem.zHi, 14.8, 1e-9, ' A');
+    near('thickness', mem.thickness, 30.0, 1e-9, ' A');
+    near('centre', mem.centre, -0.2, 1e-9, ' A');
+    ok('planes are flat', mem.flat === true);
+    ok('both planes populated', mem.planes[0] === 49 && mem.planes[1] === 49, mem.planes.join('/'));
+    ok('extent recovered', mem.extent.xMin === -15 && mem.extent.xMax === 15,
+       mem.extent.xMin + '..' + mem.extent.xMax);
+    ok('protein atom survived', st.atoms.length === 1, st.atoms.length + ' atom');
+  }
+
+  /* ------------------------------------------------------------- exclusion */
+  head('exclusion restores a neighbour');
+  {
+    const st = PDB.parse(makePDB([
+      { x: 0, y: 0, z: 0, resSeq: 1 },
+      { x: 3, y: 0, z: 0, resSeq: 2 },
+    ]), 'pair.pdb');
+    const free = 4 * Math.PI * Math.pow(3.1, 2);
+    const both = SASA.compute(st, { nPoints: 480 });
+    const excl = new Uint8Array(2); excl[1] = 1;
+    const one = SASA.compute(st, { nPoints: 480, excluded: excl });
+    ok('neighbour shrinks the area', both.sasa[0] < free * 0.95, both.sasa[0].toFixed(2) + ' A^2');
+    near('excluding it restores the full sphere', one.sasa[0], free, 1e-9, ' A^2');
+    near('the excluded atom reports nothing', one.sasa[1], 0, 1e-9, ' A^2');
+
+    const rows = SASA.residueMetrics(st, one, { excluded: excl, surfaceRSA: 20 });
+    ok('row marked excluded', rows[1].excluded === true);
+    ok('excluded row is not a candidate', SASA.isCandidate(rows[1], {}) === false);
+    ok('kept row is a candidate', SASA.isCandidate(rows[0], {}) === true);
+  }
+
+  /* ---------------------------------------------------- residues and patches */
+  head('residue metrics and patches');
+  {
+    // Three alanine-like residues in a row, 8 A apart: each sees itself plus its neighbours.
+    const list = [];
+    for (let i = 0; i < 3; i++) {
+      list.push({ name: 'N', x: i * 8, y: 0, z: 0, resName: 'ALA', resSeq: i + 1, element: 'N' });
+      list.push({ name: 'CA', x: i * 8 + 1.5, y: 0, z: 0, resName: 'ALA', resSeq: i + 1 });
+      list.push({ name: 'CB', x: i * 8 + 3.0, y: 0, z: 0, resName: 'ALA', resSeq: i + 1 });
+    }
+    const st = PDB.parse(makePDB(list), 'chain.pdb');
+    const job = SASA.compute(st, { nPoints: 200 });
+    const rows = SASA.residueMetrics(st, job, { scale: 'kd', surfaceRSA: 20 });
+    ok('three rows', rows.length === 3);
+    near('RSA follows SASA and the reference area', rows[0].rsa,
+         100 * rows[0].sasa / Chem.MAX_ASA.ALA, 1e-9, ' %');
+    ok('side-chain area excludes N and CA', rows[0].scSASA < rows[0].sasa,
+       rows[0].scSASA.toFixed(1) + ' of ' + rows[0].sasa.toFixed(1) + ' A^2');
+    ok('hydrophobicity from the scale', rows[0].hyd === 1.8, String(rows[0].hyd));
+    ok('alanine has no charge', rows[0].charge === 0);
+    ok('surface flag set', rows.every((r) => r.surface === true));
+
+    SASA.patchMetrics(rows, 10, {});
+    ok('middle residue sees all three', rows[1].patchN === 3, 'patchN = ' + rows[1].patchN);
+    ok('end residue sees two', rows[0].patchN === 2, 'patchN = ' + rows[0].patchN);
+    near('patch area is the sum of its members', rows[1].patchSASA,
+         rows[0].sasa + rows[1].sasa + rows[2].sasa, 1e-9, ' A^2');
+    near('patch hydrophobicity of one residue type', rows[1].patchHyd, 1.8, 1e-9);
+
+    const sum = SASA.summarise(rows, 'kd');
+    near('summary area', sum.sasa, rows[0].sasa + rows[1].sasa + rows[2].sasa, 1e-9, ' A^2');
+    near('summary span', sum.span, 16, 2.0, ' A');
+  }
+
+  /* --------------------------------------------------------- charge and scales */
+  head('reference data');
+  {
+    ok('aspartate is negative', Chem.charge('ASP') === -1);
+    ok('arginine is positive', Chem.charge('ARG') === 1);
+    ok('histidine is slightly positive', Chem.charge('HIS') === 0.1);
+    ok('protonation aliases resolve', Chem.charge('HIP') === 0.1 && Chem.charge('ASH') === -1);
+    ok('tryptophan reference area', Chem.maxASA('TRP') === 285);
+    ok('selenium radius', Chem.radius('SE') === 1.90);
+    ok('unknown element falls back', Chem.radius('XX') === 1.70);
+    ok('backbone atoms recognised', Chem.isBackboneAtom('CA') && !Chem.isBackboneAtom('CB'));
+    const keys = Object.keys(Chem.SCALES);
+    ok('every scale covers 20 residues',
+       keys.every((k) => Object.keys(Chem.SCALES[k].values).length === 20), keys.join(', '));
+    ok('scale directions declared',
+       Chem.SCALES.kd.hydrophobicHigh === true && Chem.SCALES.ww.hydrophobicHigh === false);
+    ok('isoleucine is hydrophobic on every scale', keys.every((k) => {
+      const s = Chem.SCALES[k], sign = s.hydrophobicHigh ? 1 : -1;
+      return sign * s.values.ILE > sign * s.values.ARG;
+    }));
+  }
+
+  /* ----------------------------------------------------------- electrostatics */
+  head('electrostatics');
+  {
+    const lambda = Elec.debyeLength(0.15);
+    near('Debye length at 150 mM', lambda, 7.85, 0.02, ' A');
+    ok('no screening without salt', Elec.debyeLength(0) === Infinity);
+
+    // One lysine nitrogen carries +1: the potential at distance d must match the closed form.
+    const st = PDB.parse(makePDB([
+      { name: 'NZ', resName: 'LYS', resSeq: 1, x: 0, y: 0, z: 0, element: 'N' },
+      { name: 'CA', resName: 'ALA', resSeq: 2, x: 10, y: 0, z: 0 },
+      { name: 'CA', resName: 'ALA', resSeq: 3, x: 6, y: 0, z: 0 },
+    ]), 'charge.pdb');
+    const s = Elec.sites(st, null);
+    ok('one charge site found', s.n === 1 && s.q[0] === 1, s.n + ' sites, total ' + s.total);
+    for (const d of [4, 6, 10, 18]) {
+      const want = Elec.COULOMB * Math.exp(-d / lambda) / (4 * d * d);
+      near('potential at ' + d + ' A', Elec.potentialAt(d, 0, 0, s, {}), want, 1e-9, ' kcal/mol.e');
+    }
+    ok('beyond the cutoff nothing is counted',
+       Elec.potentialAt(30, 0, 0, s, { cutoff: 25 }) === 0);
+
+    const job = SASA.compute(st, { nPoints: 100 });
+    const e = Elec.compute(st, job, {});
+    const want6 = Elec.COULOMB * Math.exp(-6 / lambda) / (4 * 36);
+    near('per-atom potential at the 6 A atom', e.phi[2], want6, 1e-9, ' kcal/mol.e');
+    ok('potential falls with distance', e.phi[2] > e.phi[1], e.phi[2].toFixed(3) + ' > ' + e.phi[1].toFixed(3));
+    // The charge is felt on its own accessible sphere rather than at its centre, where it diverges.
+    const dmin = Chem.radius('N') + 1.4;
+    const wantSelf = Elec.COULOMB * Math.exp(-dmin / lambda) / (4 * dmin * dmin);
+    near('a charge is felt on its own accessible sphere', e.phi[0], wantSelf, 1e-9, ' kcal/mol.e');
+    ok('which is finite and positive', e.phi[0] > 0 && e.phi[0] < 100, e.phi[0].toFixed(2));
+
+    // Excluding the lysine removes its charge: the surface is the one without that residue.
+    const excl = new Uint8Array(3); excl[0] = 1;
+    const job2 = SASA.compute(st, { nPoints: 100, excluded: excl });
+    const e2 = Elec.compute(st, job2, {});
+    near('excluded residues carry no charge', e2.phi[2], 0, 1e-12, ' kcal/mol.e');
+    ok('and no site is left', e2.sites.n === 0);
+
+    // Group charges add up to the formal charge, and ions are picked up.
+    const groups = PDB.parse(makePDB([
+      { name: 'OD1', resName: 'ASP', resSeq: 1, x: 0, y: 0, z: 0, element: 'O' },
+      { name: 'OD2', resName: 'ASP', resSeq: 1, x: 1, y: 0, z: 0, element: 'O' },
+      { name: 'CG', resName: 'ASP', resSeq: 1, x: 0.5, y: 1, z: 0 },
+      { name: 'NH1', resName: 'ARG', resSeq: 2, x: 20, y: 0, z: 0, element: 'N' },
+      { name: 'NH2', resName: 'ARG', resSeq: 2, x: 21, y: 0, z: 0, element: 'N' },
+      { name: 'ND1', resName: 'HIS', resSeq: 3, x: 40, y: 0, z: 0, element: 'N' },
+      { name: 'NE2', resName: 'HIS', resSeq: 3, x: 41, y: 0, z: 0, element: 'N' },
+      { name: 'ZN', resName: 'ZN', resSeq: 4, x: 60, y: 0, z: 0, element: 'ZN', isHet: true },
+    ]), 'groups.pdb');
+    const gs = Elec.sites(groups, null);
+    ok('carboxylate carries -1 over two oxygens', Math.abs(gs.q[0] + gs.q[1] + 1) < 1e-12);
+    ok('guanidinium carries +1 over two nitrogens',
+       Math.abs(gs.q[2] + gs.q[3] - 1) < 1e-12, gs.q[2] + '/' + gs.q[3]);
+    ok('histidine matches the charge used elsewhere',
+       Math.abs((gs.q[4] + gs.q[5]) - Chem.charge('HIS')) < 1e-12, String(gs.q[4] + gs.q[5]));
+    ok('zinc is a +2 ion', gs.q[6] === 2, String(gs.q[6]));
+    near('net charge', gs.total, -1 + 1 + 0.1 + 2, 1e-12, ' e');
+    ok('the carboxylate carbon carries nothing', gs.n === 7, gs.n + ' sites');
+
+    // Residue means are weighted by exposed area, so a buried atom cannot dominate.
+    const jobG = SASA.compute(groups, { nPoints: 100, includeHet: true });
+    const eG = Elec.compute(groups, jobG, {});
+    const perRes = Elec.perResidue(groups, jobG, eG.phi);
+    ok('aspartate reads negative', perRes[0] < 0, perRes[0].toFixed(2));
+    ok('arginine reads positive', perRes[1] > 0, perRes[1].toFixed(2));
+    ok('zinc reads strongly positive', perRes[3] > perRes[1], perRes[3].toFixed(2));
+
+    // Charges follow the atoms in the calculation: switch ligands off and the ion stops counting.
+    const jobNoHet = SASA.compute(groups, { nPoints: 100, includeHet: false });
+    const eNoHet = Elec.compute(groups, jobNoHet, {});
+    ok('ligand charges drop out with the ligands', eNoHet.sites.n === gs.n - 1,
+       eNoHet.sites.n + ' of ' + gs.n + ' sites');
+    ok('and the ion has no potential of its own', !Number.isFinite(eNoHet.phi[7]));
+
+    const es = Colour.scaleFor('esp', { espMax: 5 });
+    ok('the potential ramp is symmetric', es.domain[0] === -5 && es.domain[1] === 5);
+    ok('negative potential is red', es.rgb(-5)[0] > es.rgb(-5)[2]);
+    ok('positive potential is blue', es.rgb(5)[2] > es.rgb(5)[0]);
+    ok('the potential colours per atom', es.perAtom === true);
+  }
+
+  /* ------------------------------------------------------------------ colour */
+  head('colour scales');
+  {
+    const s = Colour.scaleFor('hydro', { scale: 'kd' });
+    const hydrophobic = s.rgb(4.5), hydrophilic = s.rgb(-4.5);
+    ok('hydrophobic end is warm', hydrophobic[0] > hydrophobic[2],
+       'rgb(' + hydrophobic.join(',') + ')');
+    ok('hydrophilic end is cool', hydrophilic[2] > hydrophilic[0],
+       'rgb(' + hydrophilic.join(',') + ')');
+    const w = Colour.scaleFor('hydro', { scale: 'ww' });
+    const wwHydrophobic = w.rgb(-2.09);
+    ok('inverted scale keeps the same meaning', wwHydrophobic[0] > wwHydrophobic[2],
+       'rgb(' + wwHydrophobic.join(',') + ')');
+    ok('missing values are grey', !Number.isFinite(NaN) && s.int(NaN) === Colour.GREY);
+    const q = Colour.scaleFor('charge', {});
+    ok('negative charge is red', q.rgb(-1)[0] > q.rgb(-1)[2]);
+    ok('positive charge is blue', q.rgb(1)[2] > q.rgb(1)[0]);
+    ok('ink contrast flips', Colour.inkOn([250, 250, 250]) !== Colour.inkOn([10, 10, 10]));
+  }
+
+  log('\n' + (fail ? 'FAIL' : 'PASS') + ': ' + pass + ' checks passed, ' + fail + ' failed.');
+} catch (e) {
+  log('\nERROR ' + (e && e.stack ? e.stack : e));
+}
+</script>

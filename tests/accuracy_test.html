@@ -1,0 +1,100 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Epitope mapper accuracy test</title>
+<body style="font:13px/1.55 ui-monospace,Consolas,monospace;background:#111;color:#ddd;padding:16px">
+<pre id="out">running...</pre>
+<script src="../js/chem.js"></script>
+<script src="../js/pdb.js"></script>
+<script src="../js/sasa.js"></script>
+<script>
+/* Per-residue areas for a real structure against an independent reference:
+ *     python tools/sasa_reference.py tests/1crn.pdb -o tests/ref_sasa.csv
+ *     python tools/sasa_reference.py tests/1crn.pdb --slab -5 5 -o tests/ref_sasa_slab.csv
+ * The reference is brute force in numpy with no neighbour grid, so a match here means the grid,
+ * the bucket arithmetic and the slab test all behave on real coordinates.
+ * Serve the folder over HTTP: fetch() cannot read files from a file:// page. */
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += s + '\n'; };
+let fail = 0;
+
+function parseCSV(text) {
+  const rows = text.trim().split(/\r?\n/).slice(1);
+  const map = new Map();
+  for (const line of rows) {
+    const f = line.split(',');
+    const sasa = parseFloat(f[4]), free = parseFloat(f[5]);
+    map.set(f[0] + '|' + f[1] + '|' + f[2],
+            { resName: f[3], sasa: sasa, free: free, lipidRef: Math.max(0, free - sasa) });
+  }
+  return map;
+}
+
+function compare(label, rows, ref, field, refField, tol) {
+  let worst = 0, worstAt = '', sum = 0, sumRef = 0, n = 0, missing = 0;
+  for (const r of rows) {
+    const key = r.chainID + '|' + r.resSeq + '|' + (r.iCode || '');
+    const want = ref.get(key);
+    if (!want) { missing++; continue; }
+    const d = Math.abs(r[field] - want[refField]);
+    if (d > worst) { worst = d; worstAt = r.label + ' ' + r.chainID; }
+    sum += r[field]; sumRef += want[refField]; n++;
+  }
+  const good = worst <= tol && !missing && n === ref.size;
+  if (!good) fail++;
+  log((good ? '  ok   ' : '  FAIL ') + label);
+  log('         residues matched ' + n + ' of ' + ref.size + (missing ? ', ' + missing + ' missing' : ''));
+  log('         total ' + sum.toFixed(4) + ' vs reference ' + sumRef.toFixed(4)
+      + ' A^2  (difference ' + (sum - sumRef).toExponential(2) + ')');
+  log('         worst residue difference ' + worst.toExponential(2) + ' A^2'
+      + (worstAt ? ' at ' + worstAt : '') + ', tolerance ' + tol);
+}
+
+(async () => {
+  out.textContent = '';
+  const pdbText = await (await fetch('1crn.pdb')).text();
+  const st = PDB.parse(pdbText, '1crn.pdb');
+  log('1crn.pdb: ' + st.atoms.length + ' atoms, ' + st.residues.length + ' residues, '
+      + st.counts.waters + ' waters dropped');
+
+  const t0 = performance.now();
+  const job = SASA.compute(st, { nPoints: 100, probe: 1.4, includeHet: true, includeH: false });
+  const ms = performance.now() - t0;
+  const rows = SASA.residueMetrics(st, job, { scale: 'kd', surfaceRSA: 20 });
+  log('100 points per atom in ' + ms.toFixed(1) + ' ms\n');
+
+  log('no membrane');
+  compare('per-residue SASA matches the brute-force reference', rows,
+          parseCSV(await (await fetch('ref_sasa.csv')).text()), 'sasa', 'sasa', 1e-6);
+
+  log('\nlipid slab from z = -5 to z = +5');
+  const jobSlab = SASA.compute(st, { nPoints: 100, probe: 1.4, slab: { zLo: -5, zHi: 5 } });
+  const rowsSlab = SASA.residueMetrics(st, jobSlab, { scale: 'kd', slab: { zLo: -5, zHi: 5 } });
+  const refSlab = parseCSV(await (await fetch('ref_sasa_slab.csv')).text());
+  compare('solvent area with the slab occluding', rowsSlab, refSlab, 'sasa', 'sasa', 1e-6);
+  compare('area ignoring the slab', rowsSlab, refSlab, 'sasaFree', 'free', 1e-6);
+  compare('lipid-buried area is the difference of the two', rowsSlab, refSlab, 'lipid', 'lipidRef', 1e-6);
+
+  log('\nconvergence with the number of test points');
+  const ref480 = SASA.compute(st, { nPoints: 480 });
+  let t480 = 0; for (const v of ref480.sasa) t480 += v;
+  for (const n of [50, 100, 200]) {
+    const j = SASA.compute(st, { nPoints: n });
+    let t = 0; for (const v of j.sasa) t += v;
+    const err = Math.abs(t - t480) / t480 * 100;
+    const good = err < (n === 50 ? 3 : n === 100 ? 2 : 1);
+    if (!good) fail++;
+    log((good ? '  ok   ' : '  FAIL ') + n + ' points: total ' + t.toFixed(1)
+        + ' A^2, ' + err.toFixed(2) + '% from the 480-point total ' + t480.toFixed(1));
+  }
+
+  log('\nexposure of the most buried and most exposed residues');
+  const sorted = rows.slice().sort((a, b) => b.rsa - a.rsa);
+  for (const r of sorted.slice(0, 3).concat(sorted.slice(-3))) {
+    log('  ' + (r.label + '    ').slice(0, 6) + ' RSA ' + r.rsa.toFixed(1).padStart(6)
+        + ' %   SASA ' + r.sasa.toFixed(1).padStart(6) + ' A^2   '
+        + (r.surface ? 'surface' : 'buried'));
+  }
+
+  log('\n' + (fail ? 'FAIL: ' + fail + ' check(s) failed.' : 'PASS: every check passed.'));
+})().catch((e) => log('\nERROR ' + (e && e.stack ? e.stack : e)));
+</script>

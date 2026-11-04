@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Epitope Mapper</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app">
+
+  <main id="stage">
+    <div id="view" aria-label="Protein structure. Drag to rotate."></div>
+
+    <section id="legend" hidden>
+      <div class="lg-title" id="lgTitle">&nbsp;</div>
+      <div class="lg-bar" id="lgBar"></div>
+      <div class="lg-scale"><span id="lgLo">&mdash;</span><span id="lgHi">&mdash;</span></div>
+      <div class="lg-keys" id="lgKeys"></div>
+    </section>
+
+    <section id="readout" aria-live="polite" hidden>
+      <div class="ro-head"><span id="roName">&mdash;</span><span id="roChain" class="ro-chain"></span></div>
+      <dl class="ro-facts">
+        <dt>SASA</dt><dd id="roSasa">&mdash;</dd>
+        <dt>Relative SASA</dt><dd id="roRsa">&mdash;</dd>
+        <dt>Hydrophobicity</dt><dd id="roHyd">&mdash;</dd>
+        <dt>Charge</dt><dd id="roCharge">&mdash;</dd>
+        <dt>Potential</dt><dd id="roEsp">&mdash;</dd>
+        <dt>Patch area</dt><dd id="roPatch">&mdash;</dd>
+        <dt>Region</dt><dd id="roZone">&mdash;</dd>
+      </dl>
+      <div id="roNote" class="ro-note" hidden></div>
+    </section>
+
+    <div id="empty">
+      <h1>Epitope mapper</h1>
+      <p>Find the solvent-exposed patches of a target structure and pick the ones worth designing a binder against.</p>
+      <p class="sub">Choose a <b>structure</b> (.pdb or .cif) in the panel, add the <b>PPM 3.0 output</b> for a membrane protein, or drop the files here.</p>
+    </div>
+
+    <div id="busy" hidden><div id="busyText">Working&hellip;</div><div class="bar"><i id="busyBar"></i></div></div>
+    <div id="dropOverlay" hidden>Drop a structure or a PPM 3.0 output to load</div>
+    <div id="hint">drag: rotate &middot; shift/right-drag: pan &middot; wheel: zoom &middot; click a residue to select it</div>
+  </main>
+
+  <section id="dock">
+    <div id="dockGrip" title="Drag to resize the table"></div>
+    <div id="dockBar">
+      <label class="dk" for="showSel">Show</label>
+      <select id="showSel" title="Which residues to list">
+        <option value="candidates" selected>Epitope candidates</option>
+        <option value="surface">All surface residues</option>
+        <option value="buried">Buried residues</option>
+        <option value="picked">Picked</option>
+        <option value="excluded">Excluded</option>
+        <option value="all">Everything</option>
+      </select>
+      <span id="sideGroup" class="dk-group" hidden>
+        <label class="dk" for="sideSel">Side</label>
+        <select id="sideSel" title="Which face of the membrane to list">
+          <option value="all" selected>Both sides</option>
+          <option value="plus">+z side</option>
+          <option value="minus">&minus;z side</option>
+        </select>
+      </span>
+      <div id="chainChips" class="chips" title="Chains to list"></div>
+      <input id="searchBox" type="search" placeholder="find residue, e.g. A137 or TRP" aria-label="Find residue">
+      <span id="tableCount" class="info"></span>
+      <span class="dk-spacer"></span>
+      <button id="csvBtn" title="Download the rows currently listed, with every column">Export CSV</button>
+    </div>
+    <div id="tableWrap">
+      <table id="resTable">
+        <thead id="tHead"></thead>
+        <tbody id="tBody"></tbody>
+      </table>
+      <div id="tableEmpty" class="table-empty">No residues to show.</div>
+    </div>
+  </section>
+
+  <aside id="panel">
+    <header>
+      <h1>Epitope mapper</h1>
+      <p>Surface residues &rarr; binder epitopes</p>
+    </header>
+
+    <section>
+      <h2>Input</h2>
+      <div class="file-row">
+        <label class="btn" for="structFile">Structure</label>
+        <input id="structFile" type="file" accept=".pdb,.ent,.cif,.mmcif,.txt">
+        <span id="structInfo" class="info">none loaded</span>
+      </div>
+      <div class="file-row">
+        <label class="btn" for="ppmFile">PPM 3.0 output</label>
+        <input id="ppmFile" type="file" accept=".pdb,.ent,.txt">
+        <span id="ppmInfo" class="info">optional</span>
+      </div>
+      <div id="fileMsg" class="msg" hidden></div>
+      <div id="structStats" class="info"></div>
+    </section>
+
+    <section>
+      <h2>Membrane</h2>
+      <div id="memStatus" class="info">No membrane defined. The whole surface is treated as solvent exposed.</div>
+      <div class="grid" id="memGrid">
+        <label for="memMode">Bilayer</label>
+        <select id="memMode">
+          <option value="auto" selected>From PPM dummy atoms</option>
+          <option value="manual">Set by hand</option>
+          <option value="off">Ignore</option>
+        </select>
+        <label for="memThick">Thickness (&Aring;)</label>
+        <input id="memThick" type="number" value="30" min="4" max="80" step="0.1" disabled>
+        <label for="memCentre">Centre z (&Aring;)</label>
+        <input id="memCentre" type="number" value="0" step="0.1" disabled>
+        <label for="memHead">Headgroup band (&Aring;)</label>
+        <input id="memHead" type="number" value="5" min="0" max="15" step="0.5">
+        <label for="memSide">+z side is</label>
+        <select id="memSide">
+          <option value="unknown" selected>unlabelled</option>
+          <option value="out">extracellular</option>
+          <option value="in">cytoplasmic</option>
+        </select>
+      </div>
+      <label class="check" title="Test points that fall inside the hydrophobic slab are counted as buried, which is what the lipid does to them."><input id="memOcclude" type="checkbox" checked> Lipid slab occludes the surface</label>
+      <label class="check" title="Residues inside the bilayer cannot be reached by a soluble binder."><input id="memSkip" type="checkbox" checked> Keep bilayer residues out of the candidates</label>
+      <label class="check"><input id="memKeepHead" type="checkbox"> &hellip;but allow headgroup residues</label>
+      <label class="check"><input id="memShow" type="checkbox" checked> Draw the bilayer planes</label>
+      <div class="grid">
+        <label for="memOpacity">Plane opacity</label>
+        <input id="memOpacity" type="range" min="0.05" max="0.6" step="0.01" value="0.22">
+      </div>
+    </section>
+
+    <section>
+      <h2>Analysis</h2>
+      <div class="grid">
+        <label for="probe">Probe radius (&Aring;)</label>
+        <input id="probe" type="number" value="1.4" min="0.5" max="5" step="0.05">
+        <label for="points">Points per atom</label>
+        <select id="points">
+          <option value="50">50, fast</option>
+          <option value="100" selected>100, normal</option>
+          <option value="200">200, fine</option>
+          <option value="480">480, reference</option>
+        </select>
+        <label for="rsaCut">Surface cut, RSA %</label>
+        <input id="rsaCut" type="number" value="20" min="0" max="100" step="1">
+        <label for="patchR">Patch radius (&Aring;)</label>
+        <input id="patchR" type="number" value="10" min="3" max="25" step="0.5">
+        <label for="scaleSel">Hydrophobicity</label>
+        <select id="scaleSel"></select>
+      </div>
+      <label class="check"><input id="incHet" type="checkbox" checked> Ligands and cofactors occlude the surface</label>
+      <label class="check"><input id="incH" type="checkbox"> Include hydrogens</label>
+      <label class="check"><input id="aaOnly" type="checkbox" checked> Candidates must be amino acids</label>
+      <div id="scaleNote" class="info note"></div>
+      <div id="analysisInfo" class="info"></div>
+    </section>
+
+    <section>
+      <h2>Excluded residues</h2>
+      <p class="info">Excluded residues are removed before the surface is computed, so neighbouring
+        residues gain the area the excluded ones were covering. Use this for flexible tags, loops you
+        will truncate, or a partner subunit you intend to leave out.</p>
+      <div class="row">
+        <input id="exclText" type="text" placeholder="A12, A20-28, B5, het" aria-label="Residues to exclude">
+        <button id="exclAdd">Add</button>
+      </div>
+      <div id="exclChips" class="chips wrap"></div>
+      <div class="row buttons">
+        <button id="exclClear">Clear all</button>
+        <button id="exclHet">Exclude het</button>
+      </div>
+      <div id="exclMsg" class="msg" hidden></div>
+    </section>
+
+    <section>
+      <h2>Picked epitope</h2>
+      <dl class="ro-facts" id="pickFacts">
+        <dt>Residues</dt><dd id="pkN">0</dd>
+        <dt>Total SASA</dt><dd id="pkSasa">&mdash;</dd>
+        <dt>Mean hydrophobicity</dt><dd id="pkHyd">&mdash;</dd>
+        <dt>Net charge</dt><dd id="pkCharge">&mdash;</dd>
+        <dt>Longest span</dt><dd id="pkSpan">&mdash;</dd>
+      </dl>
+      <label class="lbl" for="hotspots">Hotspot list</label>
+      <div class="row">
+        <input id="hotspots" type="text" readonly placeholder="pick residues in the table" aria-label="Hotspot list">
+        <button id="copyHot" title="Copy in the chain+number form used by binder design pipelines">Copy</button>
+      </div>
+      <div class="row buttons">
+        <button id="pickPatch" title="Pick every candidate within the patch radius of the selected residue">Pick patch</button>
+        <button id="pickClear">Clear picks</button>
+      </div>
+      <div class="row buttons">
+        <button id="savePdb" title="Write the kept atoms with the colouring metric in the B-factor column">Save PDB</button>
+        <button id="saveJson" title="Save every setting, the exclusions and the picked set">Save session</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Display</h2>
+      <div class="grid">
+        <label for="repSel">Representation</label>
+        <select id="repSel">
+          <option value="cartoon" selected>Cartoon + sticks</option>
+          <option value="trace">Backbone trace</option>
+          <option value="stick">Sticks</option>
+          <option value="sphere">Spheres</option>
+          <option value="line">Lines</option>
+          <option value="none">None</option>
+        </select>
+        <label for="surfSel">Surface</label>
+        <select id="surfSel">
+          <option value="none">None</option>
+          <option value="MS" selected>Molecular surface</option>
+          <option value="SAS">Solvent accessible</option>
+          <option value="VDW">van der Waals</option>
+        </select>
+        <label for="opacity">Surface opacity</label>
+        <input id="opacity" type="range" min="0.1" max="1" step="0.05" value="0.9">
+        <label for="colourSel">Colour by</label>
+        <select id="colourSel">
+          <option value="hydro" selected>Hydrophobicity</option>
+          <option value="patchHyd">Patch hydrophobicity</option>
+          <option value="rsa">Relative SASA</option>
+          <option value="sasa">SASA</option>
+          <option value="esp">Electrostatic potential</option>
+          <option value="charge">Charge</option>
+          <option value="patchCharge">Patch charge</option>
+          <option value="patchSASA">Patch area</option>
+          <option value="lipid">Buried in bilayer</option>
+          <option value="zone">Membrane region</option>
+          <option value="cls">Residue type</option>
+          <option value="chain">Chain</option>
+          <option value="bfactor">B-factor / pLDDT</option>
+        </select>
+      </div>
+      <label class="check"><input id="showExcl" type="checkbox" checked> Draw excluded residues as wireframe</label>
+      <label class="check"><input id="showLabel" type="checkbox" checked> Label the selected residue</label>
+      <label class="check"><input id="centreClick" type="checkbox"> Centre the view on the selected residue</label>
+      <div class="row buttons">
+        <button id="resetBtn">Reset view</button>
+        <button id="pngBtn">Save PNG</button>
+      </div>
+    </section>
+
+    <footer>
+      SASA by Shrake &amp; Rupley (1973) with Bondi radii and a 1.4&nbsp;&Aring; probe; relative SASA
+      against the reference areas of Tien et al. (2013). Hydrophobicity scales and their directions
+      are listed in the README. Membrane geometry is read from the DUM dummy atoms written by
+      PPM&nbsp;3.0, whose coordinates place the bilayer normal along z. The electrostatic potential is
+      Coulombic, with a distance-dependent dielectric (&epsilon;&nbsp;=&nbsp;4r), Debye screening at
+      150&nbsp;mM and formal group charges &mdash; useful for telling an acidic patch from a basic
+      one, but not a Poisson-Boltzmann calculation.
+    </footer>
+  </aside>
+</div>
+
+<script src="vendor/3Dmol-min.js"></script>
+<script src="js/chem.js"></script>
+<script src="js/pdb.js"></script>
+<script src="js/sasa.js"></script>
+<script src="js/elec.js"></script>
+<script src="js/colour.js"></script>
+<script src="js/render.js"></script>
+<script src="js/table.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
